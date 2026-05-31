@@ -19,9 +19,10 @@ const env: cdk.Environment = {
 
 const stackProps: cdk.StackProps = {
   env,
-  description: `Pet Vet Care infrastructure (${config.environment})`,
+  description: `PetVetCare infrastructure (${config.environment})`,
 };
 
+// VPC, Security Groups, Subnets
 const networkStack = new NetworkStack(
   app,
   stackName(config, 'network'),
@@ -82,7 +83,7 @@ const apiStack = new ApiStack(app, stackName(config, 'api'), {
   databaseName: config.aurora.databaseName,
   hostedZone: dnsStack.hostedZone,
   cdnDomainName: storageStack.cdnDomainName,
-});
+}); 
 apiStack.addDependency(dnsStack);
 apiStack.addDependency(networkStack);
 apiStack.addDependency(authStack);

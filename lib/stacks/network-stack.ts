@@ -25,7 +25,7 @@ export class NetworkStack extends cdk.Stack {
     this.vpc = new ec2.Vpc(this, 'Vpc', {
       vpcName: resourceName(config, 'vpc'),
       maxAzs: 2,
-      natGateways: config.environment === 'prod' ? 2 : 1,
+      natGateways: 0, // config.environment === 'prod' ? 2 : 1,
       subnetConfiguration: [
         {
           name: 'Public',

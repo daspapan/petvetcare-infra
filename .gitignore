@@ -9,3 +9,4 @@ cdk.context.json
 .env.local
 *.log
 .DS_Store
+cdk-outputs.json

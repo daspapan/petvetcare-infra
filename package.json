@@ -9,15 +9,15 @@
     "build": "tsc",
     "watch": "tsc -w",
     "cdk": "cdk",
-    "synth": "cdk synth",
-    "deploy": "cdk deploy --all",
-    "destroy": "cdk destroy --all",
+    "synth": "cdk synth --progress events --verbose",
+    "deploy": "cdk deploy --all --require-approval never --progress events --verbose --outputs-file cdk-outputs.json",
+    "destroy": "cdk destroy --all --force --progress events --verbose",
     "diff": "cdk diff",
     "bootstrap": "cdk bootstrap"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.147",
-    "@types/node": "^22.10.2",
+    "@types/node": "^22.19.19",
     "aws-cdk": "^2.173.2",
     "esbuild": "^0.24.2",
     "typescript": "~5.7.2"

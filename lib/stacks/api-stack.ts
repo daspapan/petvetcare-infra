@@ -91,7 +91,7 @@ export class ApiStack extends cdk.Stack {
         target: 'node20',
         externalModules: ['@aws-sdk/client-secrets-manager', '@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
       },
-      logRetention: logs.RetentionDays.ONE_MONTH,
+      logRetention: logs.RetentionDays.ONE_DAY, // TODO: increase to 1 month for production, and consider log group
     };
 
     const healthFunction = new nodejs.NodejsFunction(this, 'HealthFunction', {
