@@ -1,11 +1,11 @@
 import type {
-  APIGatewayProxyEventV2,
-  APIGatewayProxyResultV2,
+  APIGatewayProxyEvent,
+  APIGatewayProxyResult,
 } from 'aws-lambda';
 
 export async function handler(
-  event: APIGatewayProxyEventV2,
-): Promise<APIGatewayProxyResultV2> {
+  event: APIGatewayProxyEvent,
+): Promise<APIGatewayProxyResult> {
   return {
     statusCode: 200,
     headers: {
@@ -17,7 +17,7 @@ export async function handler(
       service: 'petvetcare-api',
       environment: process.env.APP_ENV ?? 'unknown',
       timestamp: new Date().toISOString(),
-      path: event.rawPath,
+      path: event.path,
     }),
   };
 }

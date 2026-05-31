@@ -1,38 +1,41 @@
 import * as cdk from 'aws-cdk-lib';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import { Construct } from 'constructs';
 import { EnvironmentConfig, resourceName } from '../config/environment';
 import { defaultTags, stackName } from '../utils/naming';
 
-export interface StorageStackProps extends cdk.StackProps {
+export interface PublicAssetsStackProps extends cdk.StackProps {
   readonly config: EnvironmentConfig;
   readonly hostedZone: route53.IHostedZone;
 }
 
-export class StorageStack extends cdk.Stack {
-  public readonly userContentBucket: s3.Bucket;
+/**
+ * Deployed in us-east-1 — CloudFront requires ACM certificates in us-east-1.
+ */
+export class PublicAssetsStack extends cdk.Stack {
+  public readonly publicAssetBucket: s3.Bucket;
   public readonly distribution: cloudfront.Distribution;
   public readonly presignedUrlRole: iam.Role;
-  public readonly cdnDomainName: string;
+  public readonly publicAssetUrl: string;
 
-  constructor(scope: Construct, id: string, props: StorageStackProps) {
+  constructor(scope: Construct, id: string, props: PublicAssetsStackProps) {
     super(scope, id, props);
 
     const { config, hostedZone } = props;
-    this.cdnDomainName = `${config.cdnSubdomain}.${config.domainName}`;
+    this.publicAssetUrl = `https://${config.publicAssetCdnDomain}`;
 
     Object.entries(defaultTags(config)).forEach(([key, value]) => {
       cdk.Tags.of(this).add(key, value);
     });
 
-    this.userContentBucket = new s3.Bucket(this, 'UserContentBucket', {
-      bucketName: resourceName(config, 'user-content'),
+    this.publicAssetBucket = new s3.Bucket(this, 'PublicAssetBucket', {
+      bucketName: resourceName(config, 'public-assets'),
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
       versioned: config.environment === 'prod',
@@ -69,28 +72,27 @@ export class StorageStack extends cdk.Stack {
       autoDeleteObjects: config.environment !== 'prod',
     });
 
-    const cdnCertificate = new acm.Certificate(this, 'CdnCertificate', {
-      domainName: this.cdnDomainName,
-      validation: acm.CertificateValidation.fromDns(hostedZone),
-    });
+    /* const certificate = acm.Certificate.fromCertificateArn(
+      this,
+      'CloudFrontCertificate',
+      config.certificates.cloudFrontCertificateArn,
+    );
 
     const originAccessControl = new cloudfront.S3OriginAccessControl(
       this,
-      'UserContentOac',
+      'PublicAssetsOac',
       {
-        originAccessControlName: resourceName(config, 'user-content-oac'),
+        originAccessControlName: resourceName(config, 'public-assets-oac'),
         signing: cloudfront.Signing.SIGV4_ALWAYS,
       },
     );
 
-    this.distribution = new cloudfront.Distribution(this, 'UserContentCdn', {
-      comment: `Pet Vet Care user content CDN (${config.environment})`,
+    this.distribution = new cloudfront.Distribution(this, 'PublicAssetsCdn', {
+      comment: `PetVetCare public assets CDN (${config.environment})`,
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(
-          this.userContentBucket,
-          {
-            originAccessControl,
-          },
+          this.publicAssetBucket,
+          { originAccessControl },
         ),
         viewerProtocolPolicy:
           cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -99,35 +101,34 @@ export class StorageStack extends cdk.Stack {
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         compress: true,
       },
-      domainNames: [this.cdnDomainName],
-      certificate: cdnCertificate,
+      domainNames: [config.publicAssetCdnDomain],
+      certificate,
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       priceClass:
         config.environment === 'prod'
           ? cloudfront.PriceClass.PRICE_CLASS_ALL
           : cloudfront.PriceClass.PRICE_CLASS_100,
-    });
+    }); 
 
-    this.userContentBucket.addToResourcePolicy(
+    this.publicAssetBucket.addToResourcePolicy(
       new iam.PolicyStatement({
         sid: 'AllowCloudFrontServicePrincipalRead',
         effect: iam.Effect.ALLOW,
         principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
         actions: ['s3:GetObject'],
-        resources: [this.userContentBucket.arnForObjects('*')],
+        resources: [this.publicAssetBucket.arnForObjects('*')],
         conditions: {
           StringEquals: {
             'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
           },
         },
       }),
-    );
+    ); */
 
     this.presignedUrlRole = new iam.Role(this, 'PresignedUrlRole', {
       roleName: resourceName(config, 'presigned-url-role'),
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description:
-        'Generates pre-signed S3 URLs for secure direct-to-S3 client uploads',
+      description: 'Generates pre-signed S3 URLs for direct client uploads',
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName(
           'service-role/AWSLambdaBasicExecutionRole',
@@ -143,7 +144,7 @@ export class StorageStack extends cdk.Stack {
         sid: 'GeneratePresignedUrls',
         effect: iam.Effect.ALLOW,
         actions: ['s3:PutObject', 's3:GetObject', 's3:AbortMultipartUpload'],
-        resources: [this.userContentBucket.arnForObjects('*')],
+        resources: [this.publicAssetBucket.arnForObjects('*')],
       }),
     );
 
@@ -152,35 +153,40 @@ export class StorageStack extends cdk.Stack {
         sid: 'ListBucketForMultipartUploads',
         effect: iam.Effect.ALLOW,
         actions: ['s3:ListBucketMultipartUploads'],
-        resources: [this.userContentBucket.bucketArn],
+        resources: [this.publicAssetBucket.bucketArn],
       }),
     );
 
-    new route53.ARecord(this, 'CdnAliasRecord', {
-      zone: hostedZone,
-      recordName: config.cdnSubdomain,
-      target: route53.RecordTarget.fromAlias(
-        new route53Targets.CloudFrontTarget(this.distribution),
-      ),
+    if (config.dns.createDnsRecords) {
+      new route53.ARecord(this, 'CdnAliasRecord', {
+        zone: hostedZone,
+        recordName: config.publicAssetCdnDomain.replace(
+          `.${config.dns.domainName}`,
+          '',
+        ),
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.CloudFrontTarget(this.distribution),
+        ),
+      });
+    }
+
+    new cdk.CfnOutput(this, 'CLOUDFRONT_DOMAIN', {
+      value: config.publicAssetCdnDomain,
+      exportName: `${stackName(config, 'public-assets')}:CloudFrontDomain`,
     });
 
-    new cdk.CfnOutput(this, 'UserContentBucketName', {
-      value: this.userContentBucket.bucketName,
-      exportName: `${stackName(config, 'storage')}:UserContentBucketName`,
+    new cdk.CfnOutput(this, 'PUBLIC_ASSET_BUCKET', {
+      value: this.publicAssetBucket.bucketName,
+      exportName: `${stackName(config, 'public-assets')}:PublicAssetBucket`,
     });
 
-    new cdk.CfnOutput(this, 'UserContentBucketArn', {
-      value: this.userContentBucket.bucketArn,
-      exportName: `${stackName(config, 'storage')}:UserContentBucketArn`,
+    new cdk.CfnOutput(this, 'PUBLIC_ASSET_URL', {
+      value: this.publicAssetUrl,
+      exportName: `${stackName(config, 'public-assets')}:PublicAssetUrl`,
     });
 
-    new cdk.CfnOutput(this, 'CdnDomainName', {
-      value: this.cdnDomainName,
-      exportName: `${stackName(config, 'storage')}:CdnDomainName`,
-    });
-
-    new cdk.CfnOutput(this, 'CloudFrontDistributionId', {
+    /* new cdk.CfnOutput(this, 'CloudFrontDistributionId', {
       value: this.distribution.distributionId,
-    });
+    }); */
   }
 }

@@ -28,21 +28,44 @@ export interface CorsConfig {
   readonly allowMethods: string[];
 }
 
+export interface CertificateConfig {
+  /** ACM cert in us-east-1 — required for CloudFront */
+  readonly cloudFrontCertificateArn: string;
+  /** Regional ACM cert for API Gateway custom domain (same region as API stack) */
+  readonly apiCertificateArn?: string;
+}
+
+export interface DnsConfig {
+  /** Existing Route 53 hosted zone ID — never create a new zone */
+  readonly hostedZoneId: string;
+  readonly domainName: string;
+  /** When false, DNS records must be configured externally */
+  readonly createDnsRecords: boolean;
+}
+
 export interface EnvironmentConfig {
   readonly appName: string;
-  readonly domainName: string;
-  readonly apiSubdomain: string;
-  readonly cdnSubdomain: string;
   readonly environment: DeploymentEnvironment;
-  readonly hostedZoneId?: string;
+  readonly dns: DnsConfig;
+  readonly apiSubdomain: string;
+  readonly publicAssetCdnDomain: string;
   readonly cognito: CognitoConfig;
   readonly aurora: AuroraConfig;
   readonly cors: CorsConfig;
+  readonly certificates: CertificateConfig;
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value || value.trim().length === 0) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value.trim();
 }
 
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name];
-  return value && value.length > 0 ? value : undefined;
+  return value && value.length > 0 ? value.trim() : undefined;
 }
 
 function parseList(value: string | undefined, fallback: string[]): string[] {
@@ -52,18 +75,31 @@ function parseList(value: string | undefined, fallback: string[]): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
+function normalizeCertificateArn(arn: string): string {
+  return arn.replace(/^arn\s+arn:/, 'arn:');
+}
+
 export function loadEnvironmentConfig(): EnvironmentConfig {
   const environment = (process.env.CDK_ENV ?? 'dev') as DeploymentEnvironment;
-  const domainName = 'petvetcare.app';
-  const webAppOrigin = optionalEnv('WEB_APP_ORIGIN') ?? `https://app.${domainName}`;
+  const domainName = process.env.DOMAIN_NAME ?? 'petvetcare.app';
+  const webAppOrigin =
+    optionalEnv('WEB_APP_ORIGIN') ?? `https://app.${environment}.${domainName}`;
+
+  const cloudFrontCertificateArn = normalizeCertificateArn(
+    requireEnv('ACM_CERTIFICATE_ARN'),
+  );
 
   return {
     appName: 'petvetcare',
-    domainName,
-    apiSubdomain: 'api',
-    cdnSubdomain: 'cdn',
     environment,
-    hostedZoneId: optionalEnv('HOSTED_ZONE_ID'),
+    dns: {
+      hostedZoneId: requireEnv('HOSTED_ZONE_ID'),
+      domainName,
+      createDnsRecords: process.env.CREATE_DNS_RECORDS === 'true',
+    },
+    apiSubdomain: optionalEnv('API_SUBDOMAIN') ?? `api.${environment}`,
+    publicAssetCdnDomain:
+      optionalEnv('PUBLIC_ASSET_CDN_DOMAIN') ?? `cdn.${environment}.${domainName}`,
     cognito: {
       userPoolName: `petvetcare-${environment}-users`,
       webCallbackUrls: parseList(process.env.WEB_CALLBACK_URLS, [
@@ -108,9 +144,19 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
       ],
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     },
+    certificates: {
+      cloudFrontCertificateArn,
+      apiCertificateArn: optionalEnv('API_CERTIFICATE_ARN')
+        ? normalizeCertificateArn(optionalEnv('API_CERTIFICATE_ARN')!)
+        : undefined,
+    },
   };
 }
 
 export function resourceName(config: EnvironmentConfig, suffix: string): string {
   return `${config.appName}-${config.environment}-${suffix}`;
+}
+
+export function apiDomainName(config: EnvironmentConfig): string {
+  return `${config.apiSubdomain}.${config.dns.domainName}`;
 }

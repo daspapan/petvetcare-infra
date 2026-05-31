@@ -8,6 +8,9 @@ export interface DnsStackProps extends cdk.StackProps {
   readonly config: EnvironmentConfig;
 }
 
+/**
+ * Imports an existing Route 53 hosted zone. Never creates a new zone.
+ */
 export class DnsStack extends cdk.Stack {
   public readonly hostedZone: route53.IHostedZone;
 
@@ -20,32 +23,23 @@ export class DnsStack extends cdk.Stack {
       cdk.Tags.of(this).add(key, value);
     });
 
-    if (config.hostedZoneId) {
-      this.hostedZone = route53.HostedZone.fromHostedZoneAttributes(
-        this,
-        'HostedZone',
-        {
-          hostedZoneId: config.hostedZoneId,
-          zoneName: config.domainName,
-        },
-      );
-    } else {
-      this.hostedZone = new route53.PublicHostedZone(this, 'HostedZone', {
-        zoneName: config.domainName,
-        comment: `Public hosted zone for ${config.domainName}`,
-      });
-    }
+    this.hostedZone = route53.HostedZone.fromHostedZoneAttributes(
+      this,
+      'ImportedHostedZone',
+      {
+        hostedZoneId: config.dns.hostedZoneId,
+        zoneName: config.dns.domainName,
+      },
+    );
 
     new cdk.CfnOutput(this, 'HostedZoneId', {
-      value: this.hostedZone.hostedZoneId,
+      value: config.dns.hostedZoneId,
       exportName: `${stackName(config, 'dns')}:HostedZoneId`,
     });
 
-    if (!config.hostedZoneId && this.hostedZone.hostedZoneNameServers) {
-      new cdk.CfnOutput(this, 'NameServers', {
-        value: cdk.Fn.join(',', this.hostedZone.hostedZoneNameServers),
-        description: 'Delegate petvetcare.app to these Route 53 name servers',
-      });
-    }
+    new cdk.CfnOutput(this, 'DnsManagementNote', {
+      value:
+        'Hosted zone is imported only. Configure DNS records externally or set CREATE_DNS_RECORDS=true.',
+    });
   }
 }

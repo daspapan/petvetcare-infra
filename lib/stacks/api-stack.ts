@@ -1,7 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
-import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
-import * as apigatewayv2Authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
-import * as apigatewayv2Integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
@@ -16,8 +14,9 @@ import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
+import * as rds from 'aws-cdk-lib/aws-rds';
 import * as path from 'path';
-import { EnvironmentConfig, resourceName } from '../config/environment';
+import { apiDomainName, EnvironmentConfig, resourceName } from '../config/environment';
 import { defaultTags, stackName } from '../utils/naming';
 
 export interface ApiStackProps extends cdk.StackProps {
@@ -26,19 +25,20 @@ export interface ApiStackProps extends cdk.StackProps {
   readonly lambdaSecurityGroup: ec2.ISecurityGroup;
   readonly userPool: cognito.IUserPool;
   readonly userPoolClients: cognito.IUserPoolClient[];
-  readonly userContentBucket: s3.IBucket;
+  readonly publicAssetBucket: s3.IBucket;
   readonly presignedUrlRole: iam.IRole;
   readonly databaseSecret: secretsmanager.ISecret;
-  readonly databaseEndpoint: string;
+  readonly databaseProxyEndpoint: string;
   readonly databasePort: string;
   readonly databaseName: string;
   readonly hostedZone: route53.IHostedZone;
-  readonly cdnDomainName: string;
+  readonly publicAssetUrl: string;
+  readonly databaseProxy: rds.DatabaseProxy;
 }
 
 export class ApiStack extends cdk.Stack {
-  public readonly httpApi: apigatewayv2.HttpApi;
-  public readonly apiDomainName: string;
+  public readonly restApi: apigateway.RestApi;
+  public readonly eventBus: events.EventBus;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
@@ -49,32 +49,42 @@ export class ApiStack extends cdk.Stack {
       lambdaSecurityGroup,
       userPool,
       userPoolClients,
-      userContentBucket,
+      publicAssetBucket,
       presignedUrlRole,
       databaseSecret,
-      databaseEndpoint,
+      databaseProxyEndpoint,
       databasePort,
       databaseName,
       hostedZone,
-      cdnDomainName,
+      publicAssetUrl,
+      databaseProxy,
     } = props;
 
-    this.apiDomainName = `${config.apiSubdomain}.${config.domainName}`;
+    const domain = apiDomainName(config);
 
     Object.entries(defaultTags(config)).forEach(([key, value]) => {
       cdk.Tags.of(this).add(key, value);
     });
 
-    const lambdaEnvironment = {
+    this.eventBus = new events.EventBus(this, 'ApplicationEventBus', {
+      eventBusName: resourceName(config, 'events'),
+    });
+
+    const lambdaEnvironment: Record<string, string> = {
       APP_ENV: config.environment,
       DATABASE_SECRET_ARN: databaseSecret.secretArn,
-      DATABASE_HOST: databaseEndpoint,
+      DATABASE_HOST: databaseProxyEndpoint,
+      DATABASE_PROXY_ENDPOINT: databaseProxyEndpoint,
       DATABASE_PORT: databasePort,
       DATABASE_NAME: databaseName,
-      USER_CONTENT_BUCKET: userContentBucket.bucketName,
-      CDN_DOMAIN: cdnDomainName,
+      PUBLIC_ASSET_BUCKET: publicAssetBucket.bucketName,
+      PUBLIC_ASSET_URL: publicAssetUrl,
       COGNITO_USER_POOL_ID: userPool.userPoolId,
+      COGNITO_CLIENT_ID: userPoolClients[0].userPoolClientId,
       COGNITO_REGION: this.region,
+      EVENT_BUS_NAME: this.eventBus.eventBusName,
+      CORS_ORIGIN: config.cors.webAppOrigin,
+      SES_FROM_EMAIL: process.env.SES_FROM_EMAIL ?? 'noreply@petvetcare.app',
     };
 
     const lambdaDefaults: nodejs.NodejsFunctionProps = {
@@ -89,244 +99,308 @@ export class ApiStack extends cdk.Stack {
         minify: true,
         sourceMap: true,
         target: 'node20',
-        externalModules: ['@aws-sdk/client-secrets-manager', '@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
+        externalModules: [
+          '@aws-sdk/client-secrets-manager',
+          '@aws-sdk/client-s3',
+          '@aws-sdk/s3-request-presigner',
+          '@aws-sdk/client-cognito-identity-provider',
+          '@aws-sdk/client-ses',
+          '@aws-sdk/client-eventbridge'
+        ],
+        nodeModules: ['pg']
       },
       logRetention: logs.RetentionDays.ONE_DAY, // TODO: increase to 1 month for production, and consider log group
     };
 
-    const healthFunction = new nodejs.NodejsFunction(this, 'HealthFunction', {
-      ...lambdaDefaults,
-      functionName: resourceName(config, 'health'),
-      entry: path.join(__dirname, '../../lambda/handlers/health.ts'),
-      description: 'Public health check endpoint',
-    });
-
-    const petsFunction = new nodejs.NodejsFunction(this, 'PetsFunction', {
-      ...lambdaDefaults,
-      functionName: resourceName(config, 'pets'),
-      entry: path.join(__dirname, '../../lambda/handlers/pets.ts'),
-      description: 'Pet health record CRUD operations',
-    });
-
-    const uploadsFunction = new nodejs.NodejsFunction(this, 'UploadsFunction', {
-      ...lambdaDefaults,
-      functionName: resourceName(config, 'uploads'),
-      entry: path.join(__dirname, '../../lambda/handlers/uploads.ts'),
-      description: 'Generates pre-signed S3 URLs for secure client uploads',
-      role: presignedUrlRole,
-    });
-
-    databaseSecret.grantRead(petsFunction);
-    userContentBucket.grantReadWrite(uploadsFunction);
-
-    const googleCalendarSecret = new secretsmanager.Secret(
-      this,
-      'GoogleCalendarOAuthSecret',
-      {
-        secretName: resourceName(config, 'google-calendar-oauth'),
-        description: 'Google Calendar OAuth credentials for vet visit bookings',
-        secretObjectValue: {
-          clientId: cdk.SecretValue.unsafePlainText(
-            process.env.GOOGLE_CALENDAR_CLIENT_ID ?? 'REPLACE_ME',
-          ),
-          clientSecret: cdk.SecretValue.unsafePlainText(
-            process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? 'REPLACE_ME',
-          ),
-          redirectUri: cdk.SecretValue.unsafePlainText(
-            process.env.GOOGLE_CALENDAR_REDIRECT_URI ??
-              `https://${this.apiDomainName}/integrations/google/callback`,
-          ),
-        },
-      },
-    );
-
-    const googleCalendarFunction = new nodejs.NodejsFunction(
-      this,
-      'GoogleCalendarFunction',
-      {
+    const createFn = (
+      id: string,
+      entry: string,
+      fnName: string,
+      role?: iam.IRole,
+      timeout?: cdk.Duration,
+      extraBundling?: nodejs.NodejsFunctionProps['bundling'],
+    ): nodejs.NodejsFunction => {
+      const fn = new nodejs.NodejsFunction(this, id, {
         ...lambdaDefaults,
-        functionName: resourceName(config, 'google-calendar'),
-        entry: path.join(
-          __dirname,
-          '../../lambda/handlers/google-calendar.ts',
-        ),
-        description: 'Google Calendar integration for vet visit bookings',
-        environment: {
-          ...lambdaEnvironment,
-          GOOGLE_CALENDAR_SECRET_ARN: googleCalendarSecret.secretArn,
-        },
-      },
-    );
-
-    googleCalendarSecret.grantRead(googleCalendarFunction);
-
-    const remindersFunction = new nodejs.NodejsFunction(
-      this,
-      'RemindersFunction',
-      {
-        ...lambdaDefaults,
-        functionName: resourceName(config, 'reminders'),
-        entry: path.join(__dirname, '../../lambda/handlers/reminders.ts'),
-        description:
-          'Processes vaccination and deworming reminder background jobs',
-        timeout: cdk.Duration.minutes(5),
-      },
-    );
-
-    databaseSecret.grantRead(remindersFunction);
-
-    const jwtAuthorizer = new apigatewayv2Authorizers.HttpJwtAuthorizer(
-      'CognitoJwtAuthorizer',
-      `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`,
-      {
-        jwtAudience: userPoolClients.map((client) => client.userPoolClientId),
-        identitySource: ['$request.header.Authorization'],
-      },
-    );
-
-    const corsPreflight: apigatewayv2.CorsPreflightOptions = {
-      allowOrigins: [
-        config.cors.webAppOrigin,
-        ...(config.cors.mobileAppOrigin !== '*'
-          ? [config.cors.mobileAppOrigin]
-          : ['*']),
-      ],
-      allowHeaders: config.cors.allowHeaders,
-      allowMethods: config.cors.allowMethods.map(
-        (method) => method as apigatewayv2.CorsHttpMethod,
-      ),
-      maxAge: cdk.Duration.hours(1),
-      allowCredentials: config.cors.mobileAppOrigin !== '*',
+        functionName: resourceName(config, fnName),
+        entry: path.join(__dirname, entry),
+        role,
+        timeout: timeout ?? lambdaDefaults.timeout,
+        bundling: extraBundling
+          ? { ...lambdaDefaults.bundling, ...extraBundling }
+          : lambdaDefaults.bundling,
+      });
+      databaseSecret.grantRead(fn);
+      databaseProxy.grantConnect(fn, 'petvetcare_admin');
+      return fn;
     };
 
-    this.httpApi = new apigatewayv2.HttpApi(this, 'HttpApi', {
-      apiName: resourceName(config, 'http-api'),
-      description:
-        'Unified API entry point for Pet Vet Care web and future mobile clients',
-      corsPreflight,
-      createDefaultStage: true,
-      defaultDomainMapping: undefined,
-    });
+    const migrationBundling: nodejs.NodejsFunctionProps['bundling'] = {
+      ...lambdaDefaults.bundling,
+      commandHooks: {
+        beforeBundling(): string[] {
+          return [];
+        },
+        beforeInstall(): string[] {
+          return [];
+        },
+        afterBundling(inputDir: string, outputDir: string): string[] {
+          return [
+            `mkdir -p ${outputDir}/database`,
+            `cp -r ${inputDir}/database/migrations ${outputDir}/database/migrations`,
+          ];
+        },
+      },
+    };
 
-    this.httpApi.addRoutes({
-      path: '/health',
-      methods: [apigatewayv2.HttpMethod.GET],
-      integration: new apigatewayv2Integrations.HttpLambdaIntegration(
-        'HealthIntegration',
-        healthFunction,
-      ),
-    });
-
-    this.httpApi.addRoutes({
-      path: '/pets',
-      methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
-      integration: new apigatewayv2Integrations.HttpLambdaIntegration(
-        'PetsIntegration',
-        petsFunction,
-      ),
-      authorizer: jwtAuthorizer,
-    });
-
-    this.httpApi.addRoutes({
-      path: '/pets/{petId}',
-      methods: [
-        apigatewayv2.HttpMethod.GET,
-        apigatewayv2.HttpMethod.PUT,
-        apigatewayv2.HttpMethod.DELETE,
-      ],
-      integration: new apigatewayv2Integrations.HttpLambdaIntegration(
-        'PetByIdIntegration',
-        petsFunction,
-      ),
-      authorizer: jwtAuthorizer,
-    });
-
-    this.httpApi.addRoutes({
-      path: '/uploads/presign',
-      methods: [apigatewayv2.HttpMethod.POST],
-      integration: new apigatewayv2Integrations.HttpLambdaIntegration(
-        'UploadsIntegration',
-        uploadsFunction,
-      ),
-      authorizer: jwtAuthorizer,
-    });
-
-    this.httpApi.addRoutes({
-      path: '/integrations/google/{proxy+}',
-      methods: [apigatewayv2.HttpMethod.ANY],
-      integration: new apigatewayv2Integrations.HttpLambdaIntegration(
-        'GoogleCalendarIntegration',
-        googleCalendarFunction,
-      ),
-      authorizer: jwtAuthorizer,
-    });
-
-    const apiCertificate = new acm.Certificate(this, 'ApiCertificate', {
-      domainName: this.apiDomainName,
-      validation: acm.CertificateValidation.fromDns(hostedZone),
-    });
-
-    const apiDomain = new apigatewayv2.DomainName(this, 'ApiDomainName', {
-      domainName: this.apiDomainName,
-      certificate: apiCertificate,
-    });
-
-    new apigatewayv2.ApiMapping(this, 'ApiMapping', {
-      api: this.httpApi,
-      domainName: apiDomain,
-      stage: this.httpApi.defaultStage!,
-    });
-
-    new route53.ARecord(this, 'ApiAliasRecord', {
-      zone: hostedZone,
-      recordName: config.apiSubdomain,
-      target: route53.RecordTarget.fromAlias(
-        new route53Targets.ApiGatewayv2DomainProperties(
-          apiDomain.regionalDomainName,
-          apiDomain.regionalHostedZoneId,
-        ),
-      ),
-    });
-
-    const remindersRule = new events.Rule(this, 'RemindersScheduleRule', {
-      ruleName: resourceName(config, 'reminders-daily'),
-      description:
-        'Daily cron trigger for AI-based vaccination and deworming reminders',
-      schedule: events.Schedule.cron({
-        minute: '0',
-        hour: '8',
-        month: '*',
-        weekDay: '*',
-        year: '*',
+    const healthFn = createFn('HealthFunction', '../../lambda/handlers/health.ts', 'health');
+    const authFn = createFn('AuthFunction', '../../lambda/handlers/auth.ts', 'auth');
+    authFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+        resources: ['*'],
       }),
-    });
-
-    remindersRule.addTarget(
-      new targets.LambdaFunction(remindersFunction, {
-        retryAttempts: 2,
+    );
+    authFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cognito-idp:AdminInitiateAuth', 'cognito-idp:AdminRespondToAuthChallenge', 'cognito-idp:GlobalSignOut'],
+        resources: [userPool.userPoolArn],
       }),
     );
 
-    new events.EventBus(this, 'ApplicationEventBus', {
-      eventBusName: resourceName(config, 'events'),
+    const profileFn = createFn('ProfileFunction', '../../lambda/handlers/profile.ts', 'profile');
+    const petsFn = createFn('PetsFunction', '../../lambda/handlers/pets.ts', 'pets');
+    const healthRecordsFn = createFn('HealthRecordsFunction', '../../lambda/handlers/health-records.ts', 'health-records');
+    const vaccinationsFn = createFn('VaccinationsFunction', '../../lambda/handlers/vaccinations.ts', 'vaccinations');
+    const prescriptionsFn = createFn('PrescriptionsFunction', '../../lambda/handlers/prescriptions.ts', 'prescriptions');
+    const appointmentsFn = createFn('AppointmentsFunction', '../../lambda/handlers/appointments.ts', 'appointments');
+    const doctorsFn = createFn('DoctorsFunction', '../../lambda/handlers/doctors.ts', 'doctors');
+    const storesFn = createFn('StoresFunction', '../../lambda/handlers/stores.ts', 'stores');
+    const productsFn = createFn('ProductsFunction', '../../lambda/handlers/products.ts', 'products');
+    const ordersFn = createFn('OrdersFunction', '../../lambda/handlers/orders.ts', 'orders');
+    const paymentsFn = createFn('PaymentsFunction', '../../lambda/handlers/payments.ts', 'payments');
+    const ticketsFn = createFn('TicketsFunction', '../../lambda/handlers/tickets.ts', 'tickets');
+    const adminFn = createFn('AdminFunction', '../../lambda/handlers/admin.ts', 'admin');
+    const filesFn = createFn('FilesFunction', '../../lambda/handlers/files.ts', 'files', presignedUrlRole);
+    const dbMigrationFn = createFn(
+      'DatabaseMigrationFunction',
+      '../../lambda/handlers/database-migration.ts',
+      'db-migration',
+      undefined,
+      cdk.Duration.minutes(5),
+      migrationBundling,
+    );
+
+    const remindersFn = createFn(
+      'RemindersFunction',
+      '../../lambda/handlers/reminders.ts',
+      'reminders',
+      undefined,
+      cdk.Duration.minutes(5),
+    );
+
+    publicAssetBucket.grantReadWrite(filesFn);
+
+    [petsFn, appointmentsFn, ordersFn, storesFn].forEach((fn) => {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ['events:PutEvents'],
+          resources: [this.eventBus.eventBusArn],
+        }),
+      );
     });
 
-    new cdk.CfnOutput(this, 'HttpApiUrl', {
-      value: this.httpApi.apiEndpoint,
-      exportName: `${stackName(config, 'api')}:HttpApiUrl`,
+    this.restApi = new apigateway.RestApi(this, 'RestApi', {
+      restApiName: resourceName(config, 'rest-api'),
+      description: 'PetVetCare unified REST API for web and mobile clients',
+      cloudWatchRole: true,
+      deployOptions: {
+        stageName: config.environment,
+        tracingEnabled: true,
+        metricsEnabled: true,
+        loggingLevel: apigateway.MethodLoggingLevel.INFO,
+        dataTraceEnabled: config.environment !== 'prod',
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins:
+          config.cors.mobileAppOrigin === '*'
+            ? apigateway.Cors.ALL_ORIGINS
+            : [config.cors.webAppOrigin, config.cors.mobileAppOrigin],
+        allowHeaders: config.cors.allowHeaders,
+        allowMethods: config.cors.allowMethods,
+        allowCredentials: config.cors.mobileAppOrigin !== '*',
+      },
     });
 
-    new cdk.CfnOutput(this, 'CustomApiUrl', {
-      value: `https://${this.apiDomainName}`,
-      exportName: `${stackName(config, 'api')}:CustomApiUrl`,
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+      authorizerName: resourceName(config, 'cognito-authorizer'),
+      identitySource: 'method.request.header.Authorization',
     });
 
-    new cdk.CfnOutput(this, 'GoogleCalendarSecretArn', {
-      value: googleCalendarSecret.secretArn,
+    const addRoute = (
+      resourcePath: string,
+      method: string,
+      fn: lambda.IFunction,
+      auth = true,
+    ): void => {
+      const parts = resourcePath.split('/').filter(Boolean);
+      let resource = this.restApi.root;
+      for (const part of parts) {
+        const existing = resource.getResource(part);
+        resource = existing ?? resource.addResource(part);
+      }
+      const integration = new apigateway.LambdaIntegration(fn);
+      resource.addMethod(method, integration, auth
+        ? { authorizer, authorizationType: apigateway.AuthorizationType.COGNITO }
+        : undefined);
+    };
+
+    // Public routes
+    addRoute('health', 'GET', healthFn, false);
+    addRoute('auth/send-otp', 'POST', authFn, false);
+    addRoute('auth/verify-otp', 'POST', authFn, false);
+
+    // Auth routes (JWT required)
+    addRoute('auth/logout', 'POST', authFn);
+    addRoute('auth/me', 'GET', authFn);
+
+    // Profile
+    addRoute('profile', 'GET', profileFn);
+    addRoute('profile', 'PUT', profileFn);
+    addRoute('profile/avatar', 'POST', profileFn);
+    addRoute('profile/avatar', 'DELETE', profileFn);
+
+    // Pets
+    addRoute('pets', 'GET', petsFn);
+    addRoute('pets', 'POST', petsFn);
+    addRoute('pets/{petId}', 'GET', petsFn);
+    addRoute('pets/{petId}', 'PUT', petsFn);
+    addRoute('pets/{petId}', 'DELETE', petsFn);
+
+    // Health records
+    addRoute('pets/{petId}/health-records', 'GET', healthRecordsFn);
+    addRoute('pets/{petId}/health-records', 'POST', healthRecordsFn);
+    addRoute('pets/{petId}/health-records/{recordId}', 'PUT', healthRecordsFn);
+    addRoute('pets/{petId}/health-records/{recordId}', 'DELETE', healthRecordsFn);
+
+    // Vaccinations
+    addRoute('pets/{petId}/vaccinations', 'GET', vaccinationsFn);
+    addRoute('pets/{petId}/vaccinations', 'POST', vaccinationsFn);
+    addRoute('vaccinations/{vaccinationId}', 'PUT', vaccinationsFn);
+    addRoute('vaccinations/{vaccinationId}', 'DELETE', vaccinationsFn);
+
+    // Prescriptions
+    addRoute('pets/{petId}/prescriptions', 'GET', prescriptionsFn);
+    addRoute('pets/{petId}/prescriptions', 'POST', prescriptionsFn);
+    addRoute('prescriptions/{id}', 'GET', prescriptionsFn);
+    addRoute('prescriptions/{id}', 'DELETE', prescriptionsFn);
+
+    // Appointments
+    addRoute('appointments', 'GET', appointmentsFn);
+    addRoute('appointments', 'POST', appointmentsFn);
+    addRoute('appointments/{appointmentId}', 'GET', appointmentsFn);
+    addRoute('appointments/{appointmentId}', 'PUT', appointmentsFn);
+    addRoute('appointments/{appointmentId}', 'DELETE', appointmentsFn);
+
+    // Doctors
+    addRoute('doctors', 'GET', doctorsFn);
+    addRoute('doctors', 'POST', doctorsFn);
+    addRoute('doctors/{doctorId}', 'GET', doctorsFn);
+    addRoute('doctors/{doctorId}', 'PUT', doctorsFn);
+    addRoute('doctors/{doctorId}', 'DELETE', doctorsFn);
+
+    // Stores
+    addRoute('stores/register', 'POST', storesFn);
+    addRoute('stores', 'GET', storesFn);
+    addRoute('stores/{storeId}', 'GET', storesFn);
+    addRoute('stores/{storeId}', 'PUT', storesFn);
+    addRoute('stores/{storeId}', 'DELETE', storesFn);
+    addRoute('stores/{storeId}/approve', 'POST', storesFn);
+    addRoute('stores/{storeId}/reject', 'POST', storesFn);
+
+    // Products
+    addRoute('products', 'GET', productsFn);
+    addRoute('products', 'POST', productsFn);
+    addRoute('products/{productId}', 'GET', productsFn);
+    addRoute('products/{productId}', 'PUT', productsFn);
+    addRoute('products/{productId}', 'DELETE', productsFn);
+
+    // Orders & Payments
+    addRoute('orders', 'GET', ordersFn);
+    addRoute('orders', 'POST', ordersFn);
+    addRoute('orders/{orderId}', 'GET', ordersFn);
+    addRoute('orders/{orderId}', 'PUT', ordersFn);
+    addRoute('payments/initiate', 'POST', paymentsFn);
+    addRoute('payments/success', 'POST', paymentsFn);
+    addRoute('payments/failure', 'POST', paymentsFn);
+    addRoute('payments/{paymentId}', 'GET', paymentsFn);
+
+    // Tickets
+    addRoute('tickets', 'GET', ticketsFn);
+    addRoute('tickets', 'POST', ticketsFn);
+    addRoute('tickets/{ticketId}', 'GET', ticketsFn);
+    addRoute('tickets/{ticketId}', 'PUT', ticketsFn);
+    addRoute('tickets/{ticketId}/comment', 'POST', ticketsFn);
+    addRoute('tickets/{ticketId}/assign', 'POST', ticketsFn);
+    addRoute('tickets/{ticketId}/close', 'POST', ticketsFn);
+
+    // Admin
+    addRoute('admin/dashboard', 'GET', adminFn);
+    addRoute('admin/users', 'GET', adminFn);
+    addRoute('admin/audit-logs', 'GET', adminFn);
+    addRoute('admin/analytics', 'GET', adminFn);
+    addRoute('admin/database/migrate', 'POST', dbMigrationFn);
+    addRoute('admin/database/rollback', 'POST', dbMigrationFn);
+    addRoute('admin/database/migrations', 'GET', dbMigrationFn);
+
+    // Files
+    addRoute('files/presigned-url', 'POST', filesFn);
+    addRoute('files/complete-upload', 'POST', filesFn);
+
+    if (config.certificates.apiCertificateArn) {
+      const apiCertificate = acm.Certificate.fromCertificateArn(
+        this,
+        'ApiCertificate',
+        config.certificates.apiCertificateArn,
+      );
+
+      const apiDomain = this.restApi.addDomainName('ApiDomainName', {
+        domainName: domain,
+        certificate: apiCertificate,
+        securityPolicy: apigateway.SecurityPolicy.TLS_1_2,
+        endpointType: apigateway.EndpointType.REGIONAL,
+      });
+
+      if (config.dns.createDnsRecords) {
+        new route53.ARecord(this, 'ApiAliasRecord', {
+          zone: hostedZone,
+          recordName: config.apiSubdomain,
+          target: route53.RecordTarget.fromAlias(
+            new route53Targets.ApiGatewayDomain(apiDomain),
+          ),
+        });
+      }
+
+      new cdk.CfnOutput(this, 'CustomApiUrl', {
+        value: `https://${domain}`,
+        exportName: `${stackName(config, 'api')}:CustomApiUrl`,
+      });
+    }
+
+    new events.Rule(this, 'RemindersScheduleRule', {
+      ruleName: resourceName(config, 'reminders-daily'),
+      schedule: events.Schedule.cron({ minute: '0', hour: '8' }),
+      targets: [new targets.LambdaFunction(remindersFn)],
     });
 
-    new cdk.CfnOutput(this, 'RemindersFunctionArn', {
-      value: remindersFunction.functionArn,
+    new cdk.CfnOutput(this, 'RestApiUrl', {
+      value: this.restApi.url,
+      exportName: `${stackName(config, 'api')}:RestApiUrl`,
+    });
+
+    new cdk.CfnOutput(this, 'EventBusName', {
+      value: this.eventBus.eventBusName,
     });
   }
 }

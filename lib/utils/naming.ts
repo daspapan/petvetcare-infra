@@ -12,7 +12,7 @@ export function defaultTags(config: EnvironmentConfig): Record<string, string> {
   return {
     Application: config.appName,
     Environment: config.environment,
-    Domain: config.domainName,
+    Domain: config.dns.domainName,
     ManagedBy: 'aws-cdk',
   };
 }

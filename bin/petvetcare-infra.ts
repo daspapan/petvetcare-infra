@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import * as cdk from 'aws-cdk-lib';
 import { loadEnvironmentConfig } from '../lib/config/environment';
 import { stackName } from '../lib/utils/naming';
@@ -7,14 +8,17 @@ import { AuthStack } from '../lib/stacks/auth-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
-import { StorageStack } from '../lib/stacks/storage-stack';
+import { PublicAssetsStack } from '../lib/stacks/public-assets-stack';
 
 const app = new cdk.App();
 const config = loadEnvironmentConfig();
 
+const primaryRegion = process.env.CDK_DEFAULT_REGION ?? 'ap-south-1';
+const cloudFrontRegion = 'ap-south-1'; // 'us-east-1';
+
 const env: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT,
-  region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  region: primaryRegion,
 };
 
 const stackProps: cdk.StackProps = {
@@ -22,15 +26,10 @@ const stackProps: cdk.StackProps = {
   description: `PetVetCare infrastructure (${config.environment})`,
 };
 
-// VPC, Security Groups, Subnets
-const networkStack = new NetworkStack(
-  app,
-  stackName(config, 'network'),
-  {
-    ...stackProps,
-    config,
-  },
-);
+const networkStack = new NetworkStack(app, stackName(config, 'network'), {
+  ...stackProps,
+  config,
+});
 
 const authStack = new AuthStack(app, stackName(config, 'auth'), {
   ...stackProps,
@@ -42,27 +41,25 @@ const dnsStack = new DnsStack(app, stackName(config, 'dns'), {
   config,
 });
 
-const storageStack = new StorageStack(
+const publicAssetsStack = new PublicAssetsStack(
   app,
-  stackName(config, 'storage'),
+  stackName(config, 'public-assets'),
   {
     ...stackProps,
+    env: { account: env.account, region: cloudFrontRegion },
     config,
     hostedZone: dnsStack.hostedZone,
+    crossRegionReferences: true,
   },
 );
-storageStack.addDependency(dnsStack);
+publicAssetsStack.addDependency(dnsStack);
 
-const databaseStack = new DatabaseStack(
-  app,
-  stackName(config, 'database'),
-  {
-    ...stackProps,
-    config,
-    vpc: networkStack.vpc,
-    databaseSecurityGroup: networkStack.databaseSecurityGroup,
-  },
-);
+const databaseStack = new DatabaseStack(app, stackName(config, 'database'), {
+  ...stackProps,
+  config,
+  vpc: networkStack.vpc,
+  lambdaSecurityGroup: networkStack.lambdaSecurityGroup,
+});
 databaseStack.addDependency(networkStack);
 
 const apiStack = new ApiStack(app, stackName(config, 'api'), {
@@ -75,19 +72,19 @@ const apiStack = new ApiStack(app, stackName(config, 'api'), {
     authStack.webUserPoolClient,
     authStack.mobileUserPoolClient,
   ],
-  userContentBucket: storageStack.userContentBucket,
-  presignedUrlRole: storageStack.presignedUrlRole,
+  publicAssetBucket: publicAssetsStack.publicAssetBucket,
+  presignedUrlRole: publicAssetsStack.presignedUrlRole,
   databaseSecret: databaseStack.credentials,
-  databaseEndpoint: databaseStack.cluster.clusterEndpoint.hostname,
-  databasePort: databaseStack.cluster.clusterEndpoint.port.toString(),
+  databaseProxyEndpoint: databaseStack.proxy.endpoint,
+  databasePort: '5432',
   databaseName: config.aurora.databaseName,
   hostedZone: dnsStack.hostedZone,
-  cdnDomainName: storageStack.cdnDomainName,
-}); 
-apiStack.addDependency(dnsStack);
+  publicAssetUrl: publicAssetsStack.publicAssetUrl,
+  databaseProxy: databaseStack.proxy,
+});
 apiStack.addDependency(networkStack);
 apiStack.addDependency(authStack);
-apiStack.addDependency(storageStack);
+apiStack.addDependency(publicAssetsStack);
 apiStack.addDependency(databaseStack);
 
 app.synth();

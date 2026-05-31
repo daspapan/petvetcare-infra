@@ -11,7 +11,6 @@ export interface NetworkStackProps extends cdk.StackProps {
 export class NetworkStack extends cdk.Stack {
   public readonly vpc: ec2.Vpc;
   public readonly lambdaSecurityGroup: ec2.SecurityGroup;
-  public readonly databaseSecurityGroup: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props: NetworkStackProps) {
     super(scope, id, props);
@@ -25,23 +24,11 @@ export class NetworkStack extends cdk.Stack {
     this.vpc = new ec2.Vpc(this, 'Vpc', {
       vpcName: resourceName(config, 'vpc'),
       maxAzs: 2,
-      natGateways: 0, // config.environment === 'prod' ? 2 : 1,
+      natGateways: config.environment === 'prod' ? 0 : 0,
       subnetConfiguration: [
-        {
-          name: 'Public',
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
-        {
-          name: 'Private',
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-          cidrMask: 24,
-        },
-        {
-          name: 'Isolated',
-          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
-          cidrMask: 24,
-        },
+        { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
+        { name: 'Private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
+        { name: 'Isolated', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 24 },
       ],
     });
 
@@ -62,22 +49,9 @@ export class NetworkStack extends cdk.Stack {
     this.lambdaSecurityGroup = new ec2.SecurityGroup(this, 'LambdaSecurityGroup', {
       vpc: this.vpc,
       securityGroupName: resourceName(config, 'lambda-sg'),
-      description: 'Security group for Pet Vet Care API Lambda functions',
+      description: 'Security group for PetVetCare API Lambda functions',
       allowAllOutbound: true,
     });
-
-    this.databaseSecurityGroup = new ec2.SecurityGroup(this, 'DatabaseSecurityGroup', {
-      vpc: this.vpc,
-      securityGroupName: resourceName(config, 'database-sg'),
-      description: 'Security group for Aurora PostgreSQL cluster',
-      allowAllOutbound: false,
-    });
-
-    this.databaseSecurityGroup.addIngressRule(
-      this.lambdaSecurityGroup,
-      ec2.Port.tcp(5432),
-      'Allow PostgreSQL access from Lambda functions',
-    );
 
     new cdk.CfnOutput(this, 'VpcId', {
       value: this.vpc.vpcId,
@@ -87,11 +61,6 @@ export class NetworkStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'LambdaSecurityGroupId', {
       value: this.lambdaSecurityGroup.securityGroupId,
       exportName: `${stackName(config, 'network')}:LambdaSecurityGroupId`,
-    });
-
-    new cdk.CfnOutput(this, 'DatabaseSecurityGroupId', {
-      value: this.databaseSecurityGroup.securityGroupId,
-      exportName: `${stackName(config, 'network')}:DatabaseSecurityGroupId`,
     });
   }
 }
