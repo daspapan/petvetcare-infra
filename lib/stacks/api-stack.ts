@@ -257,6 +257,7 @@ export class ApiStack extends cdk.Stack {
     };
 
     // Public routes
+    // aws logs tail /aws/lambda/petvetcare-dev-auth --follow
     addRoute('health', 'GET', healthFn, false);
     addRoute('auth/send-otp', 'POST', authFn, false);
     addRoute('auth/verify-otp', 'POST', authFn, false);

@@ -16,6 +16,7 @@ import {
   parseBody,
   requireAuth,
 } from '../shared/api';
+import { json } from 'node:stream/consumers';
 
 const ses = new SESClient({});
 const cognito = new CognitoIdentityProviderClient({});
@@ -36,34 +37,53 @@ function generateOtp(): string {
 
 /** SendOtpLambda */
 async function sendOtp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  console.log("[SendOTP] ENTER")
   const { email } = parseBody<SendOtpRequest>(event);
+  console.log("[SendOTP] email", email)
   if (!email?.includes('@')) {
     return jsonResponse(400, { error: 'Valid email is required' });
   }
 
   const otp = generateOtp();
+  console.log("[SendOTP] otp", otp)
   const fromEmail = process.env.SES_FROM_EMAIL ?? 'noreply@petvetcare.app';
+  console.log("[SendOTP] fromEmail", fromEmail)
 
-  await ses.send(
-    new SendEmailCommand({
-      Source: fromEmail,
-      Destination: { ToAddresses: [email] },
-      Message: {
-        Subject: { Data: 'PetVetCare Login OTP' },
-        Body: {
-          Text: { Data: `Your PetVetCare login code is: ${otp}. Valid for 5 minutes.` },
+  try {
+    
+    const reply = await ses.send(
+      new SendEmailCommand({
+        Source: fromEmail,
+        Destination: { ToAddresses: [email] },
+        Message: {
+          Subject: { Data: 'PetVetCare Login OTP' },
+          Body: {
+            Text: { Data: `Your PetVetCare login code is: ${otp}. Valid for 5 minutes.` },
+          },
         },
-      },
-    }),
-  );
+      }),
+    );
 
-  // In production: store OTP hash in DynamoDB/ElastiCache with TTL
-  console.log(JSON.stringify({ action: 'OTP_SENT', email, otpHash: 'redacted' }));
+    console.log(JSON.stringify(reply))
+  
+    // In production: store OTP hash in DynamoDB/ElastiCache with TTL
+    console.log(JSON.stringify({ action: 'OTP_SENT', email, otpHash: 'redacted' , otp}));
+  
+    return jsonResponse(200, {
+      message: 'OTP sent successfully',
+      expiresInSeconds: 300,
+    });
 
-  return jsonResponse(200, {
-    message: 'OTP sent successfully',
-    expiresInSeconds: 300,
-  });
+  } catch (error) {
+    console.log(error)
+    console.log(JSON.stringify(error))
+    return jsonResponse(400, {
+      message: 'OTP failed',
+      error,
+    });
+    
+  }
+  
 }
 
 /** VerifyOtpLambda */
@@ -149,6 +169,7 @@ export async function handler(
 ): Promise<APIGatewayProxyResult> {
   try {
     const { httpMethod, path } = event;
+    console.log("[AUTH.TS] HttpMethod", httpMethod, "Path", path)
 
     if (httpMethod === 'POST' && path.endsWith('/auth/send-otp')) {
       return sendOtp(event);

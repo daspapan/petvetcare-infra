@@ -24,7 +24,7 @@ export class NetworkStack extends cdk.Stack {
     this.vpc = new ec2.Vpc(this, 'Vpc', {
       vpcName: resourceName(config, 'vpc'),
       maxAzs: 2,
-      natGateways: config.environment === 'prod' ? 0 : 0,
+      natGateways: config.environment === 'prod' ? 0 : 1,
       subnetConfiguration: [
         { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
         { name: 'Private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
@@ -35,6 +35,11 @@ export class NetworkStack extends cdk.Stack {
     this.vpc.addGatewayEndpoint('S3GatewayEndpoint', {
       service: ec2.GatewayVpcEndpointAwsService.S3,
     });
+
+    this.vpc.addInterfaceEndpoint('SesEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.EMAIL_SMTP, // This covers both SMTP and HTTPS API (SES) endpoints
+      privateDnsEnabled: true,
+    })
 
     this.vpc.addInterfaceEndpoint('SecretsManagerEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
