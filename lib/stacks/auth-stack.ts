@@ -1,5 +1,12 @@
 import * as cdk from 'aws-cdk-lib';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as path  from 'path';
 import { Construct } from 'constructs';
 import { EnvironmentConfig, resourceName } from '../config/environment';
 import { defaultTags, stackName } from '../utils/naming';
@@ -23,31 +30,242 @@ export class AuthStack extends cdk.Stack {
       cdk.Tags.of(this).add(key, value);
     });
 
+    // ─── 1. OTP Rate-Limit Table ─────────────────────────────────────────────
+    const otpTable = new dynamodb.Table(this, 'OtpRateLimitTable', {
+      tableName: resourceName(config, 'otp-rate-limit'),
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl',
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecovery: config.environment === 'prod' ? true : false,
+      removalPolicy: config.environment === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+      stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
+    });
+
+    // ─── 2. Secrets (SNS sender, SES config) ─────────────────────────────────
+    /* const authSecret = new secretsmanager.Secret(this, 'AuthSecret', {
+      secretName: resourceName(config, 'passwordless-auth-config'),
+      description: 'Passwordless auth config (sender IDs, emails)',
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({
+          smsSenderId: 'AuthApp',
+          sesFromEmail: 'noreply@petvetcare.app',
+          otpLength: '6',
+          otpTtlSeconds: '300',
+          maxAttempts: '3',
+          maxResends: '5',
+        }),
+        generateStringKey: 'internalKey',
+      },
+      removalPolicy: config.environment === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+    }); */
+
+
+    // ─── 3. Lambda Execution Role ─────────────────────────────────────────────
+    const lambdaRole = new iam.Role(this, 'LambdaExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+      ],
+      inlinePolicies: {
+        AuthPolicy: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['sns:Publish'],
+              resources: ['*'],
+              conditions: {
+                StringEquals: { 'sns:Type': 'Transactional' },
+              },
+            }),
+            new iam.PolicyStatement({
+              actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: [
+                'dynamodb:GetItem', 'dynamodb:PutItem',
+                'dynamodb:UpdateItem', 'dynamodb:DeleteItem',
+                'dynamodb:Query',
+              ],
+              resources: [otpTable.tableArn],
+            }),
+            /* new iam.PolicyStatement({
+              actions: ['secretsmanager:GetSecretValue'],
+              resources: [authSecret.secretArn],
+            }), */
+            new iam.PolicyStatement({
+              actions: [
+                'cognito-idp:AdminGetUser',
+                'cognito-idp:AdminCreateUser',
+                'cognito-idp:AdminUpdateUserAttributes',
+                'cognito-idp:ListUsers',
+              ],
+              resources: ['*'], // scoped after UserPool creation below
+            }),
+            new iam.PolicyStatement({
+              actions: ['xray:PutTraceSegments', 'xray:PutTelemetryRecords'],
+              resources: ['*'],
+            }),
+          ],
+        }),
+      },
+    });
+
+    // ─── 4. Common Lambda Environment ────────────────────────────────────────
+    const commonEnv: Record<string, string> = {
+      STAGE: config.environment,
+      OTP_TABLE_NAME: otpTable.tableName,
+      // SECRET_ARN: authSecret.secretArn,
+      POWERTOOLS_SERVICE_NAME: 'passwordless-auth',
+      LOG_LEVEL: config.environment === 'prod' ? 'INFO' : 'DEBUG',
+      NODE_OPTIONS: '--enable-source-maps',
+    };
+
+    const commonLambdaProps: Partial<lambda.FunctionProps> = {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      role: lambdaRole,
+      environment: commonEnv,
+      tracing: lambda.Tracing.ACTIVE,
+      logRetention: config.environment === 'prod' ? logs.RetentionDays.ONE_MONTH : logs.RetentionDays.ONE_DAY,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      layers: [],
+    };
+
+    // ─── 5. Cognito Trigger Lambdas ───────────────────────────────────────────
+    
+    const preSignUpFn = new nodejs.NodejsFunction(
+      this,
+      'cognito-pre-signup',
+      {
+        ...commonLambdaProps,
+        functionName: resourceName(config, 'cognito-pre-signup'),
+        description: 'Auto-confirm user on sign-up for passwordless flow',
+        entry: path.join(__dirname, '../../lambda/handlers/cognito/pre-signup/index.ts'),
+        handler: 'handler',
+      },
+    );
+
+    const defineAuthFn = new nodejs.NodejsFunction(
+      this,
+      'cognito-define-auth',
+      {
+        ...commonLambdaProps,
+        functionName: resourceName(config, 'cognito-define-auth'),
+        description: 'Define authentication challenge flow',
+        entry: path.join(__dirname, '../../lambda/handlers/cognito/define-auth/index.ts'),
+        handler: 'handler',
+      },
+    );
+
+    const createChallengeFn = new nodejs.NodejsFunction(
+      this,
+      'cognito-create-challenge',
+      {
+        ...commonLambdaProps,
+        functionName: resourceName(config, 'cognito-create-challenge'),
+        description: 'Generate OTP and dispatch via SNS/SES',
+        entry: path.join(__dirname, '../../lambda/handlers/cognito/create-challenge/index.ts'),
+        handler: 'handler',
+      },
+    );
+
+    const verifyChallengeFn = new nodejs.NodejsFunction(
+      this,
+      'cognito-verify-challenge',
+      {
+        ...commonLambdaProps,
+        functionName: resourceName(config, 'cognito-verify-challenge'),
+        description: 'Verify OTP answer from user',
+        entry: path.join(__dirname, '../../lambda/handlers/cognito/verify-challenge/index.ts'),
+        handler: 'handler',
+      },
+    );
+
+    const preTokenFn = new nodejs.NodejsFunction(
+      this,
+      'cognito-pre-token',
+      {
+        ...commonLambdaProps,
+        functionName: resourceName(config, 'cognito-pre-token'),
+        description: 'Enrich Cognito tokens with custom claims',
+        entry: path.join(__dirname, '../../lambda/handlers/cognito/pre-token/index.ts'),
+        handler: 'handler',
+      },
+    );
+
+
+
+    /** Pre-SignUp: auto-confirm users (passwordless — no password verification) */
+    /* const preSignUpFn = new lambda.Function(this, 'PreSignUpFn', {
+      ...commonLambdaProps,
+      functionName: resourceName(config, 'db-bootstrap'),
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda/handlers/cognito/pre-signup')),
+      description: 'Auto-confirm user on sign-up for passwordless flow'
+    }); */
+
+    /** Define Auth Challenge: orchestrate challenge lifecycle */
+    /* const defineAuthFn = new lambda.Function(this, 'DefineAuthFn', {
+      ...commonLambdaProps,
+      functionName: `${stage}-cognito-define-auth`,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda/handlers/cognito/define-auth')),
+      description: 'Define authentication challenge flow',
+    }); */
+
+    /** Create Auth Challenge: generate + dispatch OTP */
+    /* const createChallengeFn = new lambda.Function(this, 'CreateChallengeFn', {
+      ...commonLambdaProps,
+      functionName: `${stage}-cognito-create-challenge`,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda/handlers/cognito/create-challenge')),
+      description: 'Generate OTP and dispatch via SNS/SES',
+      timeout: cdk.Duration.seconds(15),
+    }); */
+
+    /** Verify Auth Challenge: validate submitted OTP */
+    /* const verifyChallengeFn = new lambda.Function(this, 'VerifyChallengeFn', {
+      ...commonLambdaProps,
+      functionName: `${stage}-cognito-verify-challenge`,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda/handlers/cognito/verify-challenge')),
+      description: 'Verify OTP answer from user',
+    }); */
+
+    /** Pre-Token Generation: enrich ID token claims */
+    /* const preTokenFn = new lambda.Function(this, 'PreTokenFn', {
+      ...commonLambdaProps,
+      functionName: `${stage}-cognito-pre-token`,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda/handlers/cognito/pre-token')),
+      description: 'Enrich Cognito tokens with custom claims',
+    }); */
+
+    // ─── 6. Cognito User Pool ─────────────────────────────────────────────────
+
     this.userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: config.cognito.userPoolName,
       selfSignUpEnabled: true,
       signInAliases: {
+        phone: false,
         email: true,
-        username: false,
+        username: true,
+        preferredUsername: true,
       },
       autoVerify: {
         email: true,
+        phone: true,
       },
       standardAttributes: {
-        email: {
-          required: true,
-          mutable: true,
-        },
-        givenName: {
-          required: false,
-          mutable: true,
-        },
-        familyName: {
-          required: false,
-          mutable: true,
-        },
+        phoneNumber: { required: false, mutable: false },
+        email: { required: false, mutable: false },
+        fullname: { required: false, mutable: true },
       },
       customAttributes: {
+        channel:    new cognito.StringAttribute({ mutable: true }),  // SMS | EMAIL
+        deviceType: new cognito.StringAttribute({ mutable: true }),  // mobile | web
+        lastLogin:  new cognito.StringAttribute({ mutable: true }),
         tenantId: new cognito.StringAttribute({
           minLen: 1,
           maxLen: 128,
@@ -58,25 +276,69 @@ export class AuthStack extends cdk.Stack {
           maxLen: 64,
           mutable: true,
         }),
+        is_profile_complete: new cognito.BooleanAttribute({ 
+          mutable: true 
+        }),
+        joined_clubs: new cognito.DateTimeAttribute({
+          mutable: true,
+        }), // comma-separated list of club IDs, e.g. "club1,club2"
       },
+      signInCaseSensitive: false,
       passwordPolicy: {
         minLength: 12,
-        requireLowercase: true,
-        requireUppercase: true,
-        requireDigits: true,
-        requireSymbols: true,
+        requireLowercase: false,
+        requireUppercase: false,
+        requireDigits: false,
+        requireSymbols: false,
         tempPasswordValidity: cdk.Duration.days(7),
       },
-      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      accountRecovery: cognito.AccountRecovery.PHONE_AND_EMAIL,
       mfa: cognito.Mfa.OPTIONAL,
       mfaSecondFactor: {
-        sms: false,
+        sms: true,
         otp: true,
+      },
+      lambdaTriggers: {
+        preSignUp:                   preSignUpFn,
+        defineAuthChallenge:         defineAuthFn,
+        createAuthChallenge:         createChallengeFn,
+        verifyAuthChallengeResponse: verifyChallengeFn,
+        preTokenGeneration:          preTokenFn,
+      },
+      userVerification: {
+        emailSubject: '[PetVetCare] Your login code',
+        emailBody: 'Your verification code is {####} (valid for 5 minutes) since you requested a login to PetVetCare. If you did not request this, please ignore.',
+        emailStyle: cognito.VerificationEmailStyle.CODE,
+        smsMessage: 'Your verification code is {####}',
       },
       removalPolicy:
         config.environment === 'prod'
           ? cdk.RemovalPolicy.RETAIN
           : cdk.RemovalPolicy.DESTROY,
+      deletionProtection: config.environment === 'prod' ? true : false,
+      /* advancedSecurityMode: 
+        config.environment === 'prod' 
+          ? cognito.AdvancedSecurityMode.ENFORCED
+          : cognito.AdvancedSecurityMode.OFF, */
+    });
+
+    // ── User Groups ────────────────────────────────────────
+    const userGroups = [
+      { name: 'PetOwnerFree',     precedence: 50 },
+      { name: 'PetOwnerPaid',     precedence: 40 },
+      { name: 'VeterinaryDoctor', precedence: 30 },
+      { name: 'PetMedicineStore', precedence: 20 },
+      { name: 'Supervisor',       precedence: 10 },
+      { name: 'Admin',            precedence: 1  },
+    ];
+
+    userGroups.forEach(g => {
+      new cognito.CfnUserPoolGroup(this, `Group${g.name}`, {
+        userPoolId:  this.userPool.userPoolId,
+        groupName:   g.name,
+        precedence:  g.precedence,
+        description: `${g.name} user group`,
+      });
     });
 
     if (config.cognito.googleClientId && config.cognito.googleClientSecret) {
@@ -153,9 +415,9 @@ export class AuthStack extends cdk.Stack {
       userPoolClientName: resourceName(config, 'web-client'),
       generateSecret: false,
       authFlows: {
-        userSrp: true,
+        userSrp: false,
         userPassword: false,
-        custom: false,
+        custom: true,
       },
       supportedIdentityProviders,
       oAuth: {
@@ -174,9 +436,9 @@ export class AuthStack extends cdk.Stack {
       userPoolClientName: resourceName(config, 'mobile-client'),
       generateSecret: false,
       authFlows: {
-        userSrp: true,
+        userSrp: false,
         userPassword: false,
-        custom: false,
+        custom: true,
       },
       supportedIdentityProviders,
       oAuth: {

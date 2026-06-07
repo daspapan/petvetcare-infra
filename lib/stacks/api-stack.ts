@@ -80,7 +80,9 @@ export class ApiStack extends cdk.Stack {
       PUBLIC_ASSET_BUCKET: publicAssetBucket.bucketName,
       PUBLIC_ASSET_URL: publicAssetUrl,
       COGNITO_USER_POOL_ID: userPool.userPoolId,
-      COGNITO_CLIENT_ID: userPoolClients[0].userPoolClientId,
+      COGNITO_WEB_CLIENT_ID: userPoolClients[0].userPoolClientId,
+      COGNITO_MOBILE_CLIENT_ID: userPoolClients[1].userPoolClientId,
+      COGNITO_CLIENT_ID: userPoolClients[0].userPoolClientId, // TODO: remove this if not in use
       COGNITO_REGION: this.region,
       EVENT_BUS_NAME: this.eventBus.eventBusName,
       CORS_ORIGIN: config.cors.webAppOrigin,
@@ -157,13 +159,25 @@ export class ApiStack extends cdk.Stack {
     const authFn = createFn('AuthFunction', '../../lambda/handlers/auth.ts', 'auth');
     authFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+        actions: [
+          'ses:SendEmail', 
+          'ses:SendRawEmail'
+        ],
         resources: ['*'],
       }),
     );
     authFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['cognito-idp:AdminInitiateAuth', 'cognito-idp:AdminRespondToAuthChallenge', 'cognito-idp:GlobalSignOut'],
+        actions: [
+          'cognito-idp:InitiateAuth',
+          'cognito-idp:RespondToAuthChallenge',
+          'cognito-idp:AdminGetUser',
+          'cognito-idp:AdminUserGlobalSignOut',
+          'cognito-idp:RevokeToken',
+          'cognito-idp:AdminInitiateAuth', 
+          'cognito-idp:AdminRespondToAuthChallenge', 
+          'cognito-idp:GlobalSignOut'
+        ],
         resources: [userPool.userPoolArn],
       }),
     );
@@ -261,6 +275,7 @@ export class ApiStack extends cdk.Stack {
     addRoute('health', 'GET', healthFn, false);
     addRoute('auth/send-otp', 'POST', authFn, false);
     addRoute('auth/verify-otp', 'POST', authFn, false);
+    addRoute('auth/login', 'POST', authFn, false);
 
     // Auth routes (JWT required)
     addRoute('auth/logout', 'POST', authFn);

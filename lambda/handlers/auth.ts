@@ -1,6 +1,7 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import {
+  InitiateAuthCommand,
   AdminInitiateAuthCommand,
   AdminRespondToAuthChallengeCommand,
   CognitoIdentityProviderClient,
@@ -21,6 +22,15 @@ import { json } from 'node:stream/consumers';
 const ses = new SESClient({});
 const cognito = new CognitoIdentityProviderClient({});
 
+const USER_POOL_ID    = process.env.COGNITO_USER_POOL_ID!;
+const WEB_CLIENT_ID   = process.env.COGNITO_WEB_CLIENT_ID!;
+const MOBILE_CLIENT_ID = process.env.COGNITO_MOBILE_CLIENT_ID!;
+
+interface LoginRequest {
+  username: string;
+  clientType: string;
+}
+
 interface SendOtpRequest {
   email: string;
 }
@@ -35,6 +45,54 @@ function generateOtp(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function getClientId(clientType?: string): string {
+  console.log("[GetClientId] clientType", clientType)
+  console.log("[GetClientId] WEB_CLIENT_ID", WEB_CLIENT_ID)
+  console.log("[GetClientId] MOBILE_CLIENT_ID", MOBILE_CLIENT_ID)
+  return clientType === 'mobile' ? MOBILE_CLIENT_ID : WEB_CLIENT_ID;
+}
+
+/** LoginLambda */
+async function login(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  console.log("[Login] ENTER", JSON.stringify({ event }))
+  const { username, clientType } = parseBody<LoginRequest>(event);
+  
+  if (!username) return jsonResponse(400, { error: 'Username is required' }); 
+  if (!clientType || !['web', 'mobile'].includes(clientType)) {
+    return jsonResponse(400, { error: 'ClientType must be "web" or "mobile"' });
+  }
+
+  const clientId = getClientId(clientType);
+
+  const res = await cognito.send(new InitiateAuthCommand({
+    AuthFlow: 'CUSTOM_AUTH',
+    ClientId: clientId,
+    AuthParameters: {
+      USERNAME: username,
+    },
+    ClientMetadata: {
+      "custom:channel": "EMAIL",
+      "custom:deviceType": clientType 
+    }
+  }));
+
+  if (res.ChallengeName !== 'CUSTOM_CHALLENGE') {
+    console.error('Unexpected challenge', res.ChallengeName);
+    return jsonResponse(500, { error: 'Unexpected auth state' }); 
+  }
+
+  const publicParams = res.ChallengeParameters ?? {};
+
+  return jsonResponse(200, {
+    message: 'OTP sent',
+    session: res.Session,
+    username,
+    hint:    publicParams['hint'] ?? 'Check your phone or email',
+    channel: publicParams['channel'] ?? 'SMS',
+    expiresInSeconds: parseInt(publicParams['expiresInSeconds'] ?? '300'),
+  });
+  
+}
 /** SendOtpLambda */
 async function sendOtp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   console.log("[SendOTP] ENTER")
@@ -170,6 +228,10 @@ export async function handler(
   try {
     const { httpMethod, path } = event;
     console.log("[AUTH.TS] HttpMethod", httpMethod, "Path", path)
+
+    if (httpMethod === 'POST' && path.endsWith('auth/login')) {
+      return login(event);
+    }
 
     if (httpMethod === 'POST' && path.endsWith('/auth/send-otp')) {
       return sendOtp(event);
