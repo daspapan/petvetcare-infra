@@ -3,7 +3,7 @@
 *.d.ts
 node_modules
 dist
-cdk.out
+cdk.out*
 cdk.context.json
 .env
 .env.local
@@ -12,3 +12,4 @@ cdk.context.json
 cdk-outputs.json
 /postman/
 .github
+.claude*

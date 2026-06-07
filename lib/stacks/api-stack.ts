@@ -153,6 +153,7 @@ export class ApiStack extends cdk.Stack {
       },
     };
 
+<<<<<<< Updated upstream
     const healthFn = createFn('HealthFunction', '../../lambda/handlers/health.ts', 'health');
     const authFn = createFn('AuthFunction', '../../lambda/handlers/auth.ts', 'auth');
     authFn.addToRolePolicy(
@@ -198,10 +199,31 @@ export class ApiStack extends cdk.Stack {
       undefined,
       cdk.Duration.minutes(5),
     );
+=======
+    const healthFn        = createFn('HealthFunction',        '../../lambda/handlers/health.ts',           'health');
+    const meFn            = createFn('MeFunction',            '../../lambda/handlers/auth.ts',             'auth-me');
+    // const profileFn       = createFn('ProfileFunction',       '../../lambda/handlers/profile.ts',          'profile');
+    // const petsFn          = createFn('PetsFunction',          '../../lambda/handlers/pets.ts',             'pets');
+    // const healthRecordsFn = createFn('HealthRecordsFunction', '../../lambda/handlers/health-records.ts',   'health-records');
+    // const vaccinationsFn  = createFn('VaccinationsFunction',  '../../lambda/handlers/vaccinations.ts',     'vaccinations');
+    // const prescriptionsFn = createFn('PrescriptionsFunction', '../../lambda/handlers/prescriptions.ts',    'prescriptions');
+    // const appointmentsFn  = createFn('AppointmentsFunction',  '../../lambda/handlers/appointments.ts',     'appointments');
+    // const doctorsFn       = createFn('DoctorsFunction',       '../../lambda/handlers/doctors.ts',          'doctors');
+    // const storesFn        = createFn('StoresFunction',        '../../lambda/handlers/stores.ts',           'stores');
+    // const productsFn      = createFn('ProductsFunction',      '../../lambda/handlers/products.ts',         'products');
+    // const ordersFn        = createFn('OrdersFunction',        '../../lambda/handlers/orders.ts',           'orders');
+    // const paymentsFn      = createFn('PaymentsFunction',      '../../lambda/handlers/payments.ts',         'payments');
+    // const ticketsFn       = createFn('TicketsFunction',       '../../lambda/handlers/tickets.ts',          'tickets');
+    // const adminFn         = createFn('AdminFunction',         '../../lambda/handlers/admin.ts',            'admin');
+    // const filesFn         = createFn('FilesFunction',         '../../lambda/handlers/files.ts',            'files', presignedUrlRole);
+    // const dbMigrationFn   = createFn('DatabaseMigrationFunction', '../../lambda/handlers/database-migration.ts', 'db-migration', undefined, cdk.Duration.minutes(5), migrationBundling);
+    // const remindersFn     = createFn('RemindersFunction',     '../../lambda/handlers/reminders.ts',        'reminders', undefined, cdk.Duration.minutes(5));
+>>>>>>> Stashed changes
 
-    publicAssetBucket.grantReadWrite(filesFn);
+    /* publicAssetBucket.grantReadWrite(filesFn);
 
     [petsFn, appointmentsFn, ordersFn, storesFn].forEach((fn) => {
+<<<<<<< Updated upstream
       fn.addToRolePolicy(
         new iam.PolicyStatement({
           actions: ['events:PutEvents'],
@@ -209,6 +231,13 @@ export class ApiStack extends cdk.Stack {
         }),
       );
     });
+=======
+      fn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['events:PutEvents'],
+        resources: [this.eventBus.eventBusArn],
+      }));
+    }); */
+>>>>>>> Stashed changes
 
     this.restApi = new apigateway.RestApi(this, 'RestApi', {
       restApiName: resourceName(config, 'rest-api'),
@@ -266,10 +295,17 @@ export class ApiStack extends cdk.Stack {
     addRoute('auth/logout', 'POST', authFn);
     addRoute('auth/me', 'GET', authFn);
 
+<<<<<<< Updated upstream
     // Profile
     addRoute('profile', 'GET', profileFn);
     addRoute('profile', 'PUT', profileFn);
     addRoute('profile/avatar', 'POST', profileFn);
+=======
+    // ── Profile ──────────────────────────────────────────────────────────────
+    /* addRoute('profile',        'GET',    profileFn);
+    addRoute('profile',        'PUT',    profileFn);
+    addRoute('profile/avatar', 'POST',   profileFn);
+>>>>>>> Stashed changes
     addRoute('profile/avatar', 'DELETE', profileFn);
 
     // Pets
@@ -355,9 +391,15 @@ export class ApiStack extends cdk.Stack {
     addRoute('admin/database/rollback', 'POST', dbMigrationFn);
     addRoute('admin/database/migrations', 'GET', dbMigrationFn);
 
+<<<<<<< Updated upstream
     // Files
     addRoute('files/presigned-url', 'POST', filesFn);
     addRoute('files/complete-upload', 'POST', filesFn);
+=======
+    // ── Files ─────────────────────────────────────────────────────────────────
+    addRoute('files/presigned-url',   'POST', filesFn);
+    addRoute('files/complete-upload', 'POST', filesFn); */
+>>>>>>> Stashed changes
 
     if (config.certificates.apiCertificateArn) {
       const apiCertificate = acm.Certificate.fromCertificateArn(
@@ -389,11 +431,16 @@ export class ApiStack extends cdk.Stack {
       });
     }
 
+<<<<<<< Updated upstream
     new events.Rule(this, 'RemindersScheduleRule', {
+=======
+    // ── Scheduled jobs ────────────────────────────────────────────────────────
+    /* new events.Rule(this, 'RemindersScheduleRule', {
+>>>>>>> Stashed changes
       ruleName: resourceName(config, 'reminders-daily'),
       schedule: events.Schedule.cron({ minute: '0', hour: '8' }),
       targets: [new targets.LambdaFunction(remindersFn)],
-    });
+    }); */
 
     new cdk.CfnOutput(this, 'RestApiUrl', {
       value: this.restApi.url,

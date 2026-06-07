@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.147",
+    "@types/git-branch": "^2.0.5",
     "@types/node": "^22.19.19",
     "@types/pg": "^8.11.10",
     "aws-cdk": "^2.173.2",
@@ -33,6 +34,7 @@
     "aws-cdk-lib": "^2.173.2",
     "constructs": "^10.4.2",
     "dotenv": "^17.4.2",
+    "git-branch": "^2.0.1",
     "pg": "^8.13.1"
   }
 }
